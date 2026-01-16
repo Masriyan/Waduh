@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
-W.A.D.U.H. Scanner v3.0 - Pro Max Feature for Lazy Person
+W.A.D.U.H. Scanner v3.1 - Complete Automation Edition
 WordPress Analysis & Debugging Utility Helper
 AUTHORIZED USE ONLY - DO NOT SCAN TARGETS WITHOUT PERMISSION
+
+Features:
+- 100+ Attack Vectors
+- Multi-Tool Integration (Metasploit, Burp, ZAP, Nuclei, SQLMap)
+- WPScan API Integration
+- HTML Report Generation
+- WAF Detection
+- Proxy Support
 """
 
 import requests
@@ -13,17 +21,38 @@ import os
 import argparse
 import time
 import urllib3
-from urllib.parse import urlparse, urljoin
-from datetime import datetime, timezone
-from requests.exceptions import SSLError, ConnectionError, ReadTimeout
+from urllib.parse import urlparse, urljoin, quote
+from datetime import datetime, timezone, timedelta
+from requests.exceptions import SSLError, ConnectionError, ReadTimeout, RequestException
 from colorama import Fore, Style, init
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Dict, List, Tuple, Optional, Set, Any, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import base64
 import threading
 import ssl
 import socket
+import random
+
+# Optional imports for enhanced features
+try:
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+    from rich.console import Console
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+
+try:
+    from jinja2 import Template
+    JINJA2_AVAILABLE = True
+except ImportError:
+    JINJA2_AVAILABLE = False
 
 # Initialize colorama for terminal colors
 init(autoreset=True)
@@ -111,6 +140,25 @@ class YikesScanner:
         self.dangerous_xmlrpc_methods: List[str] = []
         self.sql_injection_params: List[str] = []
 
+        # v3.1 New Features
+        self.export_html: bool = getattr(args, 'export_html', False)
+        self.detect_waf: bool = getattr(args, 'detect_waf', False)
+        self.proxy: Optional[str] = getattr(args, 'proxy', None)
+        self.detected_waf: Optional[str] = None
+        self.scan_start_time: Optional[datetime] = None
+        self.scan_progress: int = 0
+        self.total_scan_steps: int = 15  # Base number of scan steps
+
+        # User-Agent rotation pool
+        self.user_agents: List[str] = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        ]
+        self.rotate_user_agent: bool = getattr(args, 'rotate_ua', False)
+
         # UPDATED HEADERS: Mimic a real Chrome Browser
         self.headers = {
             'User-Agent': (
@@ -135,13 +183,13 @@ class YikesScanner:
         """Display scanner banner"""
         if not self.quiet:
             print(Fore.CYAN + Style.BRIGHT + r"""
-    ========================================
-      W.A.D.U.H. SCANNER v3.0 - Complete Automation Edition
-(Wordpress Analysis & Debugging Utility Helper)
-    ========================================
-    [!] AUTHORIZED USE ONLY
-    [!] DO NOT SCAN TARGETS WITHOUT PERMISSION
-    ========================================
+    ╔═══════════════════════════════════════════════════════════╗
+    ║     W.A.D.U.H. SCANNER v3.1 - Complete Automation Edition ║
+    ║   WordPress Analysis & Debugging Utility Helper           ║
+    ╠═══════════════════════════════════════════════════════════╣
+    ║   [!] AUTHORIZED USE ONLY                                 ║
+    ║   [!] DO NOT SCAN TARGETS WITHOUT PERMISSION              ║
+    ╚═══════════════════════════════════════════════════════════╝
             """)
             if self.wpscan_enabled:
                 print(Fore.GREEN + "    [+] WPScan API: Enabled")
@@ -250,37 +298,90 @@ class YikesScanner:
             time.sleep(self.rate_limit)
 
     def make_request(self, url: str, timeout: Tuple[int, int] = (5, 20),
-                    method: str = "GET", **kwargs) -> Optional[requests.Response]:
-        """Helper method for making HTTP requests with consistent settings"""
+                    method: str = "GET", retries: int = 2, **kwargs) -> Optional[requests.Response]:
+        """Helper method for making HTTP requests with consistent settings
+        
+        Args:
+            url: Target URL
+            timeout: Connection and read timeout tuple
+            method: HTTP method (GET, POST, HEAD)
+            retries: Number of retry attempts on failure
+            **kwargs: Additional arguments passed to requests
+            
+        Returns:
+            Response object or None on failure
+        """
         self.apply_rate_limit()
-        try:
-            if method.upper() == "GET":
-                return requests.get(
-                    url,
-                    headers=self.headers,
-                    verify=self.verify_ssl,
-                    timeout=timeout,
-                    **kwargs
-                )
-            elif method.upper() == "POST":
-                return requests.post(
-                    url,
-                    headers=self.headers,
-                    verify=self.verify_ssl,
-                    timeout=timeout,
-                    **kwargs
-                )
-            elif method.upper() == "HEAD":
-                return requests.head(
-                    url,
-                    headers=self.headers,
-                    verify=self.verify_ssl,
-                    timeout=timeout,
-                    **kwargs
-                )
-        except Exception as e:
-            self.log(f"[!] Request error for {url}: {e}", Fore.RED, "debug")
-            return None
+        
+        # Rotate User-Agent if enabled
+        if self.rotate_user_agent:
+            self.headers['User-Agent'] = random.choice(self.user_agents)
+        
+        # Configure proxy if set
+        proxies = None
+        if self.proxy:
+            proxies = {
+                'http': self.proxy,
+                'https': self.proxy
+            }
+        
+        # Merge headers with any custom headers in kwargs
+        request_headers = self.headers.copy()
+        if 'headers' in kwargs:
+            request_headers.update(kwargs.pop('headers'))
+        
+        for attempt in range(retries + 1):
+            try:
+                if method.upper() == "GET":
+                    return requests.get(
+                        url,
+                        headers=request_headers,
+                        verify=self.verify_ssl,
+                        timeout=timeout,
+                        proxies=proxies,
+                        **kwargs
+                    )
+                elif method.upper() == "POST":
+                    return requests.post(
+                        url,
+                        headers=request_headers,
+                        verify=self.verify_ssl,
+                        timeout=timeout,
+                        proxies=proxies,
+                        **kwargs
+                    )
+                elif method.upper() == "HEAD":
+                    return requests.head(
+                        url,
+                        headers=request_headers,
+                        verify=self.verify_ssl,
+                        timeout=timeout,
+                        proxies=proxies,
+                        **kwargs
+                    )
+                elif method.upper() == "OPTIONS":
+                    return requests.options(
+                        url,
+                        headers=request_headers,
+                        verify=self.verify_ssl,
+                        timeout=timeout,
+                        proxies=proxies,
+                        **kwargs
+                    )
+            except (ConnectionError, ReadTimeout) as e:
+                if attempt < retries:
+                    self.log(f"[!] Retry {attempt + 1}/{retries} for {url}", Fore.YELLOW, "debug")
+                    time.sleep(1 * (attempt + 1))  # Exponential backoff
+                    continue
+                self.log(f"[!] Connection failed for {url}: {e}", Fore.RED, "debug")
+                return None
+            except SSLError as e:
+                self.log(f"[!] SSL error for {url}: {e}", Fore.RED, "debug")
+                return None
+            except RequestException as e:
+                self.log(f"[!] Request error for {url}: {e}", Fore.RED, "debug")
+                return None
+        return None
 
     def get_input(self) -> None:
         """Get URL input from the user"""
@@ -4032,6 +4133,390 @@ requests:
             if self.wp_version != most_common:
                 self.log(f"    [*] Cross-validated version: {most_common}", Fore.CYAN)
 
+    # ============================================================================
+    # v3.1 NEW FEATURES - WAF Detection, HTML Reports
+    # ============================================================================
+
+    def detect_waf_presence(self) -> None:
+        """Detect Web Application Firewall presence"""
+        if not self.detect_waf:
+            return
+
+        self.log("[*] Detecting Web Application Firewall (WAF)...", Fore.BLUE)
+
+        waf_signatures = {
+            'Cloudflare': [
+                ('Server', 'cloudflare'),
+                ('cf-ray', ''),
+                ('__cfduid', ''),
+                ('cf-cache-status', ''),
+            ],
+            'Sucuri': [
+                ('Server', 'Sucuri'),
+                ('X-Sucuri-ID', ''),
+                ('X-Sucuri-Cache', ''),
+            ],
+            'Wordfence': [
+                ('wfvt_', ''),  # Cookie pattern
+            ],
+            'ModSecurity': [
+                ('Server', 'mod_security'),
+                ('X-Mod-Security', ''),
+            ],
+            'AWS WAF': [
+                ('X-AMZ-CF-ID', ''),
+                ('X-AMZ-REQUEST-ID', ''),
+            ],
+            'Akamai': [
+                ('X-Akamai-Transformed', ''),
+                ('Akamai-Origin-Hop', ''),
+            ],
+            'Imperva/Incapsula': [
+                ('X-Iinfo', ''),
+                ('incap_ses_', ''),
+                ('visid_incap_', ''),
+            ],
+            'F5 BIG-IP': [
+                ('Server', 'BigIP'),
+                ('X-Cnection', ''),
+            ],
+        }
+
+        # Check response headers
+        if self.initial_response:
+            headers = self.initial_response.headers
+            cookies = self.initial_response.cookies
+
+            for waf_name, signatures in waf_signatures.items():
+                for header_name, header_value in signatures:
+                    # Check headers
+                    if header_name in headers:
+                        if not header_value or header_value.lower() in headers[header_name].lower():
+                            self.detected_waf = waf_name
+                            self.log(f"    [!] WAF Detected: {waf_name}", Fore.YELLOW)
+                            self.add_info_leak(
+                                "WAF Detected",
+                                f"Web Application Firewall detected: {waf_name}"
+                            )
+                            return
+
+                    # Check cookies
+                    for cookie in cookies:
+                        if header_name.lower() in cookie.name.lower():
+                            self.detected_waf = waf_name
+                            self.log(f"    [!] WAF Detected: {waf_name} (via cookie)", Fore.YELLOW)
+                            self.add_info_leak(
+                                "WAF Detected",
+                                f"Web Application Firewall detected: {waf_name}"
+                            )
+                            return
+
+        # Active detection - send malicious-looking request
+        try:
+            test_payloads = [
+                "/?id=1' OR '1'='1",
+                "/?<script>alert(1)</script>",
+                "/../../../etc/passwd",
+            ]
+
+            for payload in test_payloads:
+                test_url = self.target_url + payload
+                r = self.make_request(test_url, timeout=(5, 10), retries=0)
+
+                if r:
+                    # Check for WAF block patterns
+                    waf_block_patterns = [
+                        ('403 Forbidden', 'Generic WAF'),
+                        ('Access Denied', 'Generic WAF'),
+                        ('Request blocked', 'Generic WAF'),
+                        ('Attention Required', 'Cloudflare'),
+                        ('Please Wait...', 'Cloudflare'),
+                        ('You have been blocked', 'Cloudflare'),
+                        ('Sucuri WebSite Firewall', 'Sucuri'),
+                        ('Your Access To This Site Has Been Limited', 'Wordfence'),
+                        ('Not Acceptable!', 'ModSecurity'),
+                    ]
+
+                    for pattern, waf_name in waf_block_patterns:
+                        if pattern.lower() in r.text.lower():
+                            self.detected_waf = waf_name
+                            self.log(f"    [!] WAF Detected: {waf_name} (active detection)", Fore.YELLOW)
+                            self.add_info_leak(
+                                "WAF Detected",
+                                f"Web Application Firewall detected: {waf_name} via active probing"
+                            )
+                            return
+
+        except Exception:
+            pass
+
+        if not self.detected_waf:
+            self.log("    [+] No WAF detected", Fore.GREEN)
+
+    def export_html_report(self) -> None:
+        """Generate professional HTML security report"""
+        if not self.export_html:
+            return
+
+        if not JINJA2_AVAILABLE:
+            self.log("[!] Jinja2 not installed. Run: pip install jinja2", Fore.YELLOW)
+            return
+
+        self.log("[*] Generating HTML report...", Fore.BLUE)
+
+        # Calculate scan duration
+        scan_duration = "N/A"
+        if self.scan_start_time:
+            duration = datetime.now(timezone.utc) - self.scan_start_time
+            scan_duration = str(timedelta(seconds=int(duration.total_seconds())))
+
+        # Prepare severity colors
+        severity_colors = {
+            'critical': '#dc3545',
+            'high': '#fd7e14',
+            'medium': '#ffc107',
+            'low': '#17a2b8',
+            'info': '#6c757d',
+        }
+
+        # HTML Template
+        html_template = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WADUH Security Report - {{ target }}</title>
+    <style>
+        :root {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --text-primary: #c9d1d9;
+            --text-secondary: #8b949e;
+            --accent: #58a6ff;
+            --border: #30363d;
+            --critical: #f85149;
+            --high: #ff7b72;
+            --medium: #d29922;
+            --low: #58a6ff;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+        }
+        .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+        header {
+            background: linear-gradient(135deg, #1a1f2e 0%, #2d1f3d 100%);
+            padding: 2rem;
+            border-radius: 12px;
+            margin-bottom: 2rem;
+            border: 1px solid var(--border);
+        }
+        h1 { color: var(--accent); font-size: 2rem; margin-bottom: 0.5rem; }
+        .subtitle { color: var(--text-secondary); }
+        .meta { display: flex; gap: 2rem; margin-top: 1rem; flex-wrap: wrap; }
+        .meta-item { background: var(--bg-secondary); padding: 0.5rem 1rem; border-radius: 6px; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1rem; margin: 2rem 0; }
+        .stat-card {
+            background: var(--bg-secondary);
+            padding: 1.5rem;
+            border-radius: 12px;
+            text-align: center;
+            border: 1px solid var(--border);
+        }
+        .stat-number { font-size: 2.5rem; font-weight: bold; }
+        .stat-label { color: var(--text-secondary); margin-top: 0.5rem; }
+        .stat-critical .stat-number { color: var(--critical); }
+        .stat-high .stat-number { color: var(--high); }
+        .stat-medium .stat-number { color: var(--medium); }
+        .stat-low .stat-number { color: var(--low); }
+        section { margin: 2rem 0; }
+        h2 { color: var(--accent); margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid var(--border); }
+        .vuln-card {
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+            border-left: 4px solid;
+        }
+        .vuln-critical { border-left-color: var(--critical); }
+        .vuln-high { border-left-color: var(--high); }
+        .vuln-medium { border-left-color: var(--medium); }
+        .vuln-low { border-left-color: var(--low); }
+        .vuln-title { font-weight: bold; margin-bottom: 0.5rem; }
+        .vuln-desc { color: var(--text-secondary); font-size: 0.9rem; }
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+        .badge-critical { background: var(--critical); color: white; }
+        .badge-high { background: var(--high); color: white; }
+        .badge-medium { background: var(--medium); color: black; }
+        .badge-low { background: var(--low); color: white; }
+        footer { text-align: center; padding: 2rem; color: var(--text-secondary); }
+        table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+        th, td { padding: 0.75rem; text-align: left; border-bottom: 1px solid var(--border); }
+        th { background: var(--bg-secondary); color: var(--accent); }
+        code { background: var(--bg-secondary); padding: 0.2rem 0.4rem; border-radius: 4px; font-size: 0.9rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔒 W.A.D.U.H. Security Report</h1>
+            <p class="subtitle">WordPress Analysis & Debugging Utility Helper v3.1</p>
+            <div class="meta">
+                <span class="meta-item">🎯 <strong>Target:</strong> {{ target }}</span>
+                <span class="meta-item">📅 <strong>Date:</strong> {{ scan_date }}</span>
+                <span class="meta-item">⏱️ <strong>Duration:</strong> {{ scan_duration }}</span>
+                {% if wp_version %}<span class="meta-item">📦 <strong>WordPress:</strong> {{ wp_version }}</span>{% endif %}
+                {% if waf %}<span class="meta-item">🛡️ <strong>WAF:</strong> {{ waf }}</span>{% endif %}
+            </div>
+        </header>
+
+        <div class="stats">
+            <div class="stat-card stat-critical">
+                <div class="stat-number">{{ stats.critical }}</div>
+                <div class="stat-label">Critical</div>
+            </div>
+            <div class="stat-card stat-high">
+                <div class="stat-number">{{ stats.high }}</div>
+                <div class="stat-label">High</div>
+            </div>
+            <div class="stat-card stat-medium">
+                <div class="stat-number">{{ stats.medium }}</div>
+                <div class="stat-label">Medium</div>
+            </div>
+            <div class="stat-card stat-low">
+                <div class="stat-number">{{ stats.low }}</div>
+                <div class="stat-label">Low</div>
+            </div>
+        </div>
+
+        {% if vulnerabilities %}
+        <section>
+            <h2>🚨 Vulnerabilities ({{ vulnerabilities|length }})</h2>
+            {% for vuln in vulnerabilities %}
+            <div class="vuln-card vuln-{{ vuln.severity }}">
+                <div class="vuln-title">
+                    <span class="badge badge-{{ vuln.severity }}">{{ vuln.severity }}</span>
+                    {{ vuln.title }}
+                </div>
+                <div class="vuln-desc">{{ vuln.description }}</div>
+                {% if vuln.evidence %}<div class="vuln-desc"><strong>Evidence:</strong> <code>{{ vuln.evidence[:100] }}</code></div>{% endif %}
+            </div>
+            {% endfor %}
+        </section>
+        {% endif %}
+
+        {% if plugins %}
+        <section>
+            <h2>🔌 Detected Plugins ({{ plugins|length }})</h2>
+            <table>
+                <tr><th>Plugin</th><th>Version</th></tr>
+                {% for plugin in plugins %}
+                <tr>
+                    <td>{{ plugin.slug }}</td>
+                    <td>{{ plugin.version or 'Unknown' }}</td>
+                </tr>
+                {% endfor %}
+            </table>
+        </section>
+        {% endif %}
+
+        {% if users %}
+        <section>
+            <h2>👤 Enumerated Users ({{ users|length }})</h2>
+            <table>
+                <tr><th>Username</th></tr>
+                {% for user in users %}
+                <tr><td>{{ user }}</td></tr>
+                {% endfor %}
+            </table>
+        </section>
+        {% endif %}
+
+        {% if info_leaks %}
+        <section>
+            <h2>📢 Information Disclosure ({{ info_leaks|length }})</h2>
+            {% for leak in info_leaks %}
+            <div class="vuln-card vuln-low">
+                <div class="vuln-title">{{ leak.title }}</div>
+                <div class="vuln-desc">{{ leak.description }}</div>
+            </div>
+            {% endfor %}
+        </section>
+        {% endif %}
+
+        <footer>
+            <p>Generated by W.A.D.U.H. Scanner v3.1</p>
+            <p>⚠️ AUTHORIZED USE ONLY - For security testing purposes</p>
+        </footer>
+    </div>
+</body>
+</html>
+        """
+
+        try:
+            template = Template(html_template)
+
+            # Calculate stats
+            stats = {
+                'critical': len([v for v in self.vulnerabilities if v.get('severity') == 'critical']),
+                'high': len([v for v in self.vulnerabilities if v.get('severity') == 'high']),
+                'medium': len([v for v in self.vulnerabilities if v.get('severity') == 'medium']),
+                'low': len([v for v in self.vulnerabilities if v.get('severity') == 'low']),
+            }
+
+            html_content = template.render(
+                target=self.target_url,
+                scan_date=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                scan_duration=scan_duration,
+                wp_version=self.wp_version,
+                waf=self.detected_waf,
+                stats=stats,
+                vulnerabilities=self.vulnerabilities,
+                plugins=self.detected_plugins,
+                users=self.found_users,
+                info_leaks=self.info_leaks,
+            )
+
+            # Save HTML report
+            output_path = self.output_dir if self.output_dir else "."
+            if self.output_dir and not os.path.exists(self.output_dir):
+                os.makedirs(self.output_dir)
+
+            host = urlparse(self.target_url).netloc.replace(":", "_").replace("/", "_")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            html_file = os.path.join(output_path, f"waduh_{host}_report_{timestamp}.html")
+
+            with open(html_file, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+
+            self.log(f"    [+] HTML report saved: {html_file}", Fore.GREEN + Style.BRIGHT)
+
+        except Exception as e:
+            self.log(f"    [!] Failed to generate HTML report: {e}", Fore.RED)
+
+    def update_progress(self, step_name: str) -> None:
+        """Update scan progress indicator"""
+        self.scan_progress += 1
+        if not self.quiet:
+            percentage = min(100, int((self.scan_progress / self.total_scan_steps) * 100))
+            bar_width = 30
+            filled = int(bar_width * percentage / 100)
+            bar = '█' * filled + '░' * (bar_width - filled)
+            print(f"\r    [{bar}] {percentage}% - {step_name}", end='', flush=True)
+            if percentage >= 100:
+                print()  # New line when complete
+
     # ---------------- MAIN FLOW ----------------
 
     def run(self) -> None:
@@ -4047,6 +4532,13 @@ requests:
         if not self.check_connection():
             self.log("[!] Scan aborted due to connection failure.", Fore.RED)
             return
+
+        # v3.1 Start timing
+        self.scan_start_time = datetime.now(timezone.utc)
+
+        # v3.1 WAF Detection (early to inform scan strategy)
+        if self.detect_waf:
+            self.detect_waf_presence()
 
         # Core checks
         self.detect_version()
@@ -4145,6 +4637,10 @@ requests:
         # Generate enhanced remediation guide (always generated)
         self.generate_enhanced_remediation()
 
+        # v3.1 HTML report
+        if self.export_html:
+            self.export_html_report()
+
         # Send webhook notification if configured
         if self.webhook:
             self.send_webhook({'type': 'scan_complete'})
@@ -4153,7 +4649,7 @@ requests:
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description="W.A.D.U.H. - WordPress Analysis & Debugging Utility Helper v3.0 Complete Automation Edition",
+        description="W.A.D.U.H. - WordPress Analysis & Debugging Utility Helper v3.1 Complete Automation Edition",
         epilog="AUTHORIZED USE ONLY - Only scan targets you have permission to test"
     )
 
@@ -4406,6 +4902,31 @@ def parse_arguments() -> argparse.Namespace:
         '--test-upload',
         action='store_true',
         help='Analyze file upload security'
+    )
+
+    # v3.1 New Features
+    parser.add_argument(
+        '--export-html',
+        action='store_true',
+        help='Generate professional HTML security report'
+    )
+
+    parser.add_argument(
+        '--detect-waf',
+        action='store_true',
+        help='Detect Web Application Firewall (WAF) presence'
+    )
+
+    parser.add_argument(
+        '--proxy',
+        type=str,
+        help='HTTP/SOCKS proxy URL (e.g., http://127.0.0.1:8080)'
+    )
+
+    parser.add_argument(
+        '--rotate-ua',
+        action='store_true',
+        help='Rotate User-Agent between requests'
     )
 
     return parser.parse_args()
